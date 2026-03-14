@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { NavLink, useNavigate } from 'react-router-dom';
 import {
   LayoutDashboard, Server, Globe, Shield, GitCompare,
-  Download, Target, Upload, ChevronDown, Wifi, Terminal, Menu, X
+  Download, Target, Upload, ChevronDown, Wifi, Terminal, Menu, X, Settings
 } from 'lucide-react';
 import { useScanStore } from '../store/scanStore';
 
@@ -15,6 +15,7 @@ const navItems = [
   { to: '/recommendations', icon: Target, label: 'Recommendations' },
   { to: '/export', icon: Download, label: 'Export Targets' },
   { to: '/upload', icon: Upload, label: 'Upload Scan' },
+  { to: '/rule-builder', icon: Settings, label: 'Rule Builder' },
 ];
 
 export default function Layout({ children }: { children: React.ReactNode }) {

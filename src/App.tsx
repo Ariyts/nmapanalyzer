@@ -8,6 +8,7 @@ import Diff from './pages/Diff';
 import Recommendations from './pages/Recommendations';
 import Export from './pages/Export';
 import UploadPage from './pages/Upload';
+import RuleBuilderPage from './pages/RuleBuilderPage';
 
 export default function App() {
   return (
@@ -22,6 +23,7 @@ export default function App() {
           <Route path="/recommendations" element={<Recommendations />} />
           <Route path="/export" element={<Export />} />
           <Route path="/upload" element={<UploadPage />} />
+          <Route path="/rule-builder" element={<RuleBuilderPage />} />
         </Routes>
       </Layout>
     </HashRouter>

@@ -20,6 +20,7 @@ import type {
   MatcherPriority 
 } from '../../configs/types';
 import { MatcherPriority as MP } from '../../configs/types';
+import { allServiceConfigs } from '../../configs/services';
 
 // ============================================
 // TYPES
@@ -54,6 +55,7 @@ interface HostData {
 export class ServiceMatcher {
   private configs: ServiceConfig[] = [];
   private configMap: Map<string, ServiceConfig> = new Map();
+  private static defaultConfigs: ServiceConfig[] = allServiceConfigs;
 
   constructor(configs: ServiceConfig[]) {
     this.configs = configs;
@@ -61,11 +63,75 @@ export class ServiceMatcher {
   }
 
   /**
+   * Create a ServiceMatcher with configs from IndexedDB (with fallback to static configs)
+   */
+  static async createFromStorage(): Promise<ServiceMatcher> {
+    try {
+      const { getAllConfigs, initializeWithDefaults } = await import('../storage/indexedDB');
+      
+      // Initialize with defaults if empty
+      await initializeWithDefaults(ServiceMatcher.defaultConfigs);
+      
+      // Load from IndexedDB
+      const configs = await getAllConfigs();
+      
+      return new ServiceMatcher(configs);
+    } catch (error) {
+      console.warn('Failed to load configs from IndexedDB, using defaults:', error);
+      return new ServiceMatcher(ServiceMatcher.defaultConfigs);
+    }
+  }
+
+  /**
+   * Reload configs from IndexedDB
+   */
+  async reloadFromStorage(): Promise<void> {
+    try {
+      const { getAllConfigs } = await import('../storage/indexedDB');
+      const configs = await getAllConfigs();
+      
+      this.configs = configs;
+      this.configMap.clear();
+      configs.forEach(cfg => this.configMap.set(cfg.id, cfg));
+    } catch (error) {
+      console.warn('Failed to reload configs from IndexedDB:', error);
+    }
+  }
+
+  /**
    * Add a service config to the matcher
    */
   addConfig(config: ServiceConfig): void {
+    // Remove existing config with same ID
+    const existingIndex = this.configs.findIndex(c => c.id === config.id);
+    if (existingIndex >= 0) {
+      this.configs.splice(existingIndex, 1);
+    }
+    
     this.configs.push(config);
     this.configMap.set(config.id, config);
+  }
+
+  /**
+   * Remove a config by ID
+   */
+  removeConfig(id: string): void {
+    this.configs = this.configs.filter(c => c.id !== id);
+    this.configMap.delete(id);
+  }
+
+  /**
+   * Get all configs
+   */
+  getConfigs(): ServiceConfig[] {
+    return [...this.configs];
+  }
+
+  /**
+   * Get a config by ID
+   */
+  getConfig(id: string): ServiceConfig | undefined {
+    return this.configMap.get(id);
   }
 
   /**
