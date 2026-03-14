@@ -1,116 +1,238 @@
-import { Host, ScanInfo, ScanDiff, PortChanges, ServiceGroup, ADInfrastructure, Recommendation } from '../types';
+/**
+ * Nmap Analyzer - Configuration-Driven Implementation
+ * 
+ * This module provides analysis functions for Nmap scan results.
+ * All business logic is driven by service configurations and the ServiceMatcher.
+ * 
+ * Features:
+ * - Heuristic service matching (service name, CPE, banner, port)
+ * - Unknown service detection and logging
+ * - Active Directory infrastructure detection
+ * - Scan comparison and diff
+ * - Security recommendations generation
+ */
 
-export const SERVICE_CATEGORIES: Record<string, { label: string; ports: number[]; services: string[]; color: string }> = {
-  web: {
-    label: 'Web',
-    ports: [80, 443, 8080, 8443, 8000, 8888, 8008, 9443, 4443],
-    services: ['http', 'https', 'http-proxy', 'ssl/http', 'https-alt'],
-    color: '#3b82f6',
-  },
-  smb: {
-    label: 'SMB',
-    ports: [445, 139],
-    services: ['microsoft-ds', 'netbios-ssn'],
-    color: '#f59e0b',
-  },
-  remote_access: {
-    label: 'Remote Access',
-    ports: [22, 3389, 5985, 5986, 5900, 5901, 23],
-    services: ['ssh', 'ms-wbt-server', 'wsman', 'vnc', 'telnet'],
-    color: '#8b5cf6',
-  },
-  databases: {
-    label: 'Databases',
-    ports: [1433, 3306, 5432, 1521, 27017, 6379, 9200, 5984],
-    services: ['ms-sql-s', 'mysql', 'postgresql', 'oracle', 'mongod', 'redis', 'wap-wsp'],
-    color: '#ef4444',
-  },
-  mail: {
-    label: 'Mail',
-    ports: [25, 110, 143, 465, 587, 993, 995],
-    services: ['smtp', 'pop3', 'imap', 'smtps', 'submission', 'imaps'],
-    color: '#10b981',
-  },
-  domain_services: {
-    label: 'Domain Services',
-    ports: [53, 88, 389, 636, 3268, 3269, 464, 135],
-    services: ['domain', 'kerberos-sec', 'ldap', 'tcpwrapped', 'msft-gc', 'msrpc', 'kpasswd5'],
-    color: '#f97316',
-  },
-  printers: {
-    label: 'Printers',
-    ports: [9100, 515, 631],
-    services: ['jetdirect', 'printer', 'ipp'],
-    color: '#6b7280',
-  },
-};
+import type { Host, ScanInfo, ScanDiff, PortChanges, ServiceGroup, ADInfrastructure, Recommendation } from '../types';
+import type { MatchResult, UnknownService, ServiceConfig } from '../configs/types';
+import { ServiceMatcher, createHostDataFromNmap } from './matcher';
+import { otherHandler } from './matcher/OtherHandler';
+import { 
+  allServiceConfigs, 
+  categories, 
+  getCategory,
+  type CategoryDefinition 
+} from '../configs/services';
 
-export const HIGH_VALUE_PORTS: Record<number, string> = {
-  9200: 'Elasticsearch (often misconfigured)',
-  6379: 'Redis (often no auth)',
-  3306: 'MySQL (possible data access)',
-  1433: 'MSSQL (check for weak creds)',
-  27017: 'MongoDB (often no auth)',
-  5984: 'CouchDB (check admin party)',
-  5985: 'WinRM (remote code execution)',
-  5986: 'WinRM HTTPS',
-  23: 'Telnet (cleartext creds)',
-};
+// ============================================================================
+// Types
+// ============================================================================
 
-export function classifyServices(hosts: Host[]): ServiceGroup[] {
-  const groups: ServiceGroup[] = [];
-
-  Object.entries(SERVICE_CATEGORIES).forEach(([key, cat]) => {
-    const matchingHosts: Host[] = [];
-    const matchingPorts: { ip: string; port: (typeof hosts)[0]['ports'][0] }[] = [];
-
-    hosts.forEach((host) => {
-      if (host.state !== 'up') return;
-      const openPorts = host.ports.filter((p) => p.state === 'open');
-      const matched = openPorts.filter(
-        (p) => cat.ports.includes(p.number) || cat.services.some((s) => p.service.toLowerCase().includes(s))
-      );
-      if (matched.length > 0) {
-        matchingHosts.push(host);
-        matched.forEach((mp) => matchingPorts.push({ ip: host.ip, port: mp }));
-      }
-    });
-
-    if (matchingHosts.length > 0) {
-      groups.push({
-        category: key,
-        label: cat.label,
-        color: cat.color,
-        hosts: matchingHosts,
-        ports: matchingPorts,
-      });
-    }
-  });
-
-  return groups.sort((a, b) => b.hosts.length - a.hosts.length);
+interface ServiceMatch {
+  host: Host;
+  port: Host['ports'][0];
+  matchResult: MatchResult;
 }
 
-export function detectADInfrastructure(hosts: Host[]): ADInfrastructure {
+interface AnalysisResult {
+  matchedServices: ServiceMatch[];
+  unknownServices: UnknownService[];
+  serviceGroups: ServiceGroup[];
+  adInfrastructure: ADInfrastructure | null;
+}
+
+// ============================================================================
+// Service Matcher Instance
+// ============================================================================
+
+const serviceMatcher = new ServiceMatcher(allServiceConfigs);
+
+// ============================================================================
+// Legacy Compatibility Exports
+// ============================================================================
+
+/**
+ * Get all unique ports from all service configs (for high-value port detection)
+ */
+function getAllHighValuePorts(): Record<number, string> {
+  const ports: Record<number, string> = {};
+  
+  for (const config of allServiceConfigs) {
+    const standardPorts = config.matchers.standardPorts || [];
+    for (const port of standardPorts) {
+      ports[port] = config.name;
+    }
+  }
+  
+  return ports;
+}
+
+export const HIGH_VALUE_PORTS = getAllHighValuePorts();
+
+/**
+ * Legacy categories format for backward compatibility
+ */
+export const SERVICE_CATEGORIES: Record<string, { 
+  label: string; 
+  color: string; 
+  ports: number[]; 
+  services: string[] 
+}> = {};
+
+for (const cat of categories) {
+  const configsWithCategory = allServiceConfigs.filter(c => c.categoryId === cat.id);
+  const ports = new Set<number>();
+  const services = new Set<string>();
+  
+  for (const config of configsWithCategory) {
+    config.matchers.standardPorts?.forEach(p => ports.add(p));
+    config.matchers.serviceNames?.forEach(s => services.add(s));
+  }
+  
+  SERVICE_CATEGORIES[cat.id] = {
+    label: cat.name,
+    color: cat.color,
+    ports: Array.from(ports),
+    services: Array.from(services),
+  };
+}
+
+// ============================================================================
+// Service Classification (New Config-Driven)
+// ============================================================================
+
+/**
+ * Analyze hosts and match services using the configuration-driven matcher
+ */
+export function analyzeHosts(hosts: Host[]): AnalysisResult {
+  const matchedServices: ServiceMatch[] = [];
+  const unknownServices: UnknownService[] = [];
+  
+  // Clear previous unknown services
+  otherHandler.clear();
+  
+  for (const host of hosts) {
+    if (host.state !== 'up') continue;
+    
+    const hostData = createHostDataFromNmap(host);
+    const { matched, unknown } = serviceMatcher.analyzeHost(hostData);
+    
+    // Add matched services
+    for (const match of matched) {
+      const port = host.ports.find(
+        p => p.number === parseInt(match.matchedData) || 
+             p.service === match.matchedData ||
+             p.state === 'open'
+      );
+      
+      if (port) {
+        matchedServices.push({
+          host,
+          port,
+          matchResult: match,
+        });
+      }
+    }
+    
+    // Add unknown services
+    unknownServices.push(...unknown);
+    otherHandler.addUnknownServices(unknown);
+  }
+  
+  // Create service groups
+  const serviceGroups = createServiceGroups(matchedServices);
+  
+  // Detect AD infrastructure
+  const adInfrastructure = detectADInfrastructure(hosts);
+  
+  return {
+    matchedServices,
+    unknownServices,
+    serviceGroups,
+    adInfrastructure,
+  };
+}
+
+/**
+ * Classify hosts into service groups based on matched configs
+ */
+export function classifyServices(hosts: Host[]): ServiceGroup[] {
+  const { serviceGroups } = analyzeHosts(hosts);
+  return serviceGroups;
+}
+
+/**
+ * Create service groups from matched services
+ */
+function createServiceGroups(matchedServices: ServiceMatch[]): ServiceGroup[] {
+  const groupsMap = new Map<string, ServiceGroup>();
+  
+  for (const match of matchedServices) {
+    const categoryId = match.matchResult.config.categoryId;
+    const config = match.matchResult.config;
+    
+    if (!groupsMap.has(categoryId)) {
+      const category = getCategory(categoryId);
+      groupsMap.set(categoryId, {
+        category: categoryId,
+        label: category?.name || categoryId,
+        color: category?.color || '#6b7280',
+        hosts: [],
+        ports: [],
+      });
+    }
+    
+    const group = groupsMap.get(categoryId)!;
+    
+    // Add host if not already present
+    if (!group.hosts.includes(match.host)) {
+      group.hosts.push(match.host);
+    }
+    
+    // Add port
+    group.ports.push({ ip: match.host.ip, port: match.port });
+  }
+  
+  return Array.from(groupsMap.values()).sort((a, b) => b.hosts.length - a.hosts.length);
+}
+
+// ============================================================================
+// Active Directory Detection
+// ============================================================================
+
+/**
+ * Detect Active Directory infrastructure from scan results
+ */
+export function detectADInfrastructure(hosts: Host[]): ADInfrastructure | null {
   const dcs: { host: Host; confidence: number }[] = [];
   const possibleDCs: { host: Host; confidence: number }[] = [];
 
-  hosts.forEach((host) => {
-    if (host.state !== 'up') return;
+  for (const host of hosts) {
+    if (host.state !== 'up') continue;
     if (host.isDC && host.dcConfidence !== undefined) {
       if (host.dcConfidence >= 0.8) dcs.push({ host, confidence: host.dcConfidence });
       else if (host.dcConfidence >= 0.4) possibleDCs.push({ host, confidence: host.dcConfidence });
     }
-  });
+  }
+
+  if (dcs.length === 0 && possibleDCs.length === 0) {
+    return null;
+  }
 
   // Detect domain from DC hostnames or LDAP banners
   let domain: string | undefined;
-  dcs.forEach((dc) => {
-    if (dc.host.domain && !domain) domain = dc.host.domain;
-  });
+  for (const dc of dcs) {
+    if (dc.host.domain && !domain) {
+      domain = dc.host.domain;
+      break;
+    }
+  }
   if (!domain) {
-    possibleDCs.forEach((dc) => {
-      if (dc.host.domain && !domain) domain = dc.host.domain;
-    });
+    for (const dc of possibleDCs) {
+      if (dc.host.domain && !domain) {
+        domain = dc.host.domain;
+        break;
+      }
+    }
   }
 
   // Domain-joined hosts
@@ -126,6 +248,13 @@ export function detectADInfrastructure(hosts: Host[]): ADInfrastructure {
   };
 }
 
+// ============================================================================
+// Scan Comparison
+// ============================================================================
+
+/**
+ * Compare two scans and detect changes
+ */
 export function diffScans(scan1: ScanInfo, scan2: ScanInfo): ScanDiff {
   const hosts1Map = new Map(scan1.hosts.filter((h) => h.state === 'up').map((h) => [h.ip, h]));
   const hosts2Map = new Map(scan2.hosts.filter((h) => h.state === 'up').map((h) => [h.ip, h]));
@@ -162,7 +291,12 @@ export function diffScans(scan1: ScanInfo, scan2: ScanInfo): ScanDiff {
         newPorts.push(port);
         newPortsCount++;
         if (HIGH_VALUE_PORTS[port.number]) {
-          highValueFindings.push({ ip, port: port.number, service: port.service, reason: HIGH_VALUE_PORTS[port.number] });
+          highValueFindings.push({ 
+            ip, 
+            port: port.number, 
+            service: port.service, 
+            reason: HIGH_VALUE_PORTS[port.number] 
+          });
         }
       }
     });
@@ -180,7 +314,12 @@ export function diffScans(scan1: ScanInfo, scan2: ScanInfo): ScanDiff {
   newHosts.forEach((host) => {
     host.ports.forEach((port) => {
       if (HIGH_VALUE_PORTS[port.number]) {
-        highValueFindings.push({ ip: host.ip, port: port.number, service: port.service, reason: HIGH_VALUE_PORTS[port.number] });
+        highValueFindings.push({ 
+          ip: host.ip, 
+          port: port.number, 
+          service: port.service, 
+          reason: HIGH_VALUE_PORTS[port.number] 
+        });
         newPortsCount++;
       }
     });
@@ -197,161 +336,151 @@ export function diffScans(scan1: ScanInfo, scan2: ScanInfo): ScanDiff {
   };
 }
 
+// ============================================================================
+// Recommendations Generator (Config-Driven)
+// ============================================================================
+
+/**
+ * Generate security recommendations based on detected services
+ * Uses service configurations for attack techniques
+ */
 export function generateRecommendations(hosts: Host[]): Recommendation[] {
   const recs: Recommendation[] = [];
-  const upHosts = hosts.filter((h) => h.state === 'up');
+  const analysis = analyzeHosts(hosts);
+  
+  // Group matched services by config
+  const configMatches = new Map<ServiceConfig, ServiceMatch[]>();
+  for (const match of analysis.matchedServices) {
+    const config = match.matchResult.config;
+    if (!configMatches.has(config)) {
+      configMatches.set(config, []);
+    }
+    configMatches.get(config)!.push(match);
+  }
 
-  // AD / DC
-  const dcHosts = upHosts.filter((h) => h.isDC && (h.dcConfidence || 0) >= 0.8);
-  if (dcHosts.length > 0) {
-    const domain = dcHosts[0].domain || '{domain}';
-    const dcIPs = dcHosts.map((h) => h.ip);
+  // AD / DC - Critical
+  if (analysis.adInfrastructure && analysis.adInfrastructure.domainControllers.length > 0) {
+    const ad = analysis.adInfrastructure;
+    const domain = ad.domain || '{domain}';
+    const dcIPs = ad.domainControllers.map((dc) => dc.host.ip);
+    const adConfig = allServiceConfigs.find(c => c.id === 'active-directory');
+    
+    const checks: string[] = [
+      `# Active Directory detected — Domain: ${domain}`,
+      `# ${ad.domainControllers.length} Domain Controller(s) found`,
+      '',
+    ];
+    
+    if (adConfig?.techniques) {
+      for (const tech of adConfig.techniques.slice(0, 4)) {
+        checks.push(`## ${tech.name}`);
+        checks.push(...(tech.commands?.slice(0, 2).map(c => c.command) || []));
+        checks.push('');
+      }
+    }
+    
     recs.push({
       priority: 'CRITICAL',
       category: 'Active Directory',
       targets: dcIPs,
       icon: '🔴',
-      checks: [
-        `# Active Directory detected — Domain: ${domain}`,
-        `GetNPUsers.py ${domain}/ -no-pass -usersfile users.txt`,
-        `GetUserSPNs.py ${domain}/user:pass -dc-ip ${dcIPs[0]}`,
-        `bloodhound-python -d ${domain} -u user -p pass -ns ${dcIPs[0]} -c all`,
-        `ldapsearch -x -H ldap://${dcIPs[0]} -b '' -s base namingContexts`,
-        `kerbrute userenum --dc ${dcIPs[0]} -d ${domain} users.txt`,
-        `crackmapexec smb ${dcIPs.join(',')} --shares`,
-      ],
+      checks: checks.filter(Boolean),
     });
   }
 
-  // SMB
-  const smbHosts = upHosts.filter((h) => h.ports.some((p) => p.number === 445 && p.state === 'open'));
-  if (smbHosts.length > 0) {
+  // Process each matched service config
+  for (const [config, matches] of configMatches) {
+    if (config.id === 'active-directory') continue; // Already handled
+    
+    const uniqueHosts = [...new Set(matches.map(m => m.host))];
+    const uniqueIPs = uniqueHosts.map(h => h.ip);
+    
+    const checks: string[] = [
+      `# ${config.name} (${uniqueHosts.length} hosts)`,
+      '',
+    ];
+    
+    // Add techniques
+    const techniques = config.techniques || [];
+    for (const tech of techniques.slice(0, 5)) {
+      checks.push(`## ${tech.name}`);
+      if (tech.description) {
+        checks.push(`# ${tech.description}`);
+      }
+      for (const cmd of (tech.commands || []).slice(0, 2)) {
+        checks.push(cmd.command);
+      }
+      checks.push('');
+    }
+    
+    // Determine priority
+    let priority: Recommendation['priority'] = 'MEDIUM';
+    if (config.cves?.some(c => (c.cvss || 0) >= 9)) {
+      priority = 'CRITICAL';
+    } else if (config.cves?.some(c => (c.cvss || 0) >= 7)) {
+      priority = 'HIGH';
+    }
+    
     recs.push({
-      priority: 'HIGH',
-      category: `SMB (${smbHosts.length} hosts)`,
-      targets: smbHosts.map((h) => h.ip),
-      icon: '🟠',
-      checks: [
-        `crackmapexec smb targets.txt --shares`,
-        `crackmapexec smb targets.txt --sessions`,
-        `crackmapexec smb targets.txt --gen-relay-list relay_targets.txt`,
-        `enum4linux-ng {ip}`,
-        `nmap --script smb-vuln* {ip}`,
-        `nmap --script smb-vuln-ms17-010 {ip}`,
-        `smbclient -L //{ip} -N`,
-      ],
+      priority,
+      category: `${config.name} (${uniqueHosts.length} hosts)`,
+      targets: uniqueIPs,
+      icon: getPriorityIcon(priority),
+      checks: checks.filter(Boolean),
     });
   }
 
-  // MSSQL
-  const mssqlHosts = upHosts.filter((h) => h.ports.some((p) => p.number === 1433 && p.state === 'open'));
-  if (mssqlHosts.length > 0) {
+  // Add unknown services recommendation
+  if (analysis.unknownServices.length > 0) {
+    const unknownPorts = [...new Set(analysis.unknownServices.map(s => s.port))];
+    const unknownHosts = [...new Set(analysis.unknownServices.map(s => s.hostIp))];
+    
     recs.push({
-      priority: 'HIGH',
-      category: `MSSQL (${mssqlHosts.length} hosts)`,
-      targets: mssqlHosts.map((h) => h.ip),
-      icon: '🟠',
+      priority: 'LOW',
+      category: `Unknown Services (${analysis.unknownServices.length} services)`,
+      targets: unknownHosts,
+      icon: '❓',
       checks: [
-        `crackmapexec mssql {ip} -u sa -p ''`,
-        `crackmapexec mssql {ip} -u sa -p sa`,
-        `mssqlclient.py domain/user:pass@{ip}`,
-        `nmap -p 1433 --script ms-sql-info,ms-sql-config,ms-sql-ntlm-info {ip}`,
-        `Check xp_cmdshell availability`,
+        `# ${analysis.unknownServices.length} unknown/unclassified services detected`,
+        `# Unique ports: ${unknownPorts.slice(0, 10).join(', ')}${unknownPorts.length > 10 ? '...' : ''}`,
+        '',
+        '## Recommended enumeration:',
+        `nmap -sV -sC -p${unknownPorts.slice(0, 20).join(',')} ${unknownHosts.slice(0, 5).join(' ')}`,
+        '',
+        '## Review in Unknown Services tab for details',
       ],
     });
   }
 
-  // WinRM
-  const winrmHosts = upHosts.filter((h) => h.ports.some((p) => [5985, 5986].includes(p.number) && p.state === 'open'));
-  if (winrmHosts.length > 0) {
-    recs.push({
-      priority: 'HIGH',
-      category: `WinRM (${winrmHosts.length} hosts)`,
-      targets: winrmHosts.map((h) => h.ip),
-      icon: '🟠',
-      checks: [
-        `crackmapexec winrm {ip} -u user -p pass`,
-        `evil-winrm -i {ip} -u user -p pass`,
-      ],
-    });
-  }
-
-  // Redis
-  const redisHosts = upHosts.filter((h) => h.ports.some((p) => p.number === 6379 && p.state === 'open'));
-  if (redisHosts.length > 0) {
-    recs.push({
-      priority: 'HIGH',
-      category: `Redis (${redisHosts.length} hosts)`,
-      targets: redisHosts.map((h) => h.ip),
-      icon: '🟠',
-      checks: [
-        `redis-cli -h {ip} INFO`,
-        `redis-cli -h {ip} CONFIG GET *`,
-        `redis-cli -h {ip} CONFIG SET dir /var/www/html`,
-        `Check unauthenticated access and SLAVEOF for RCE`,
-      ],
-    });
-  }
-
-  // Elasticsearch
-  const esHosts = upHosts.filter((h) => h.ports.some((p) => p.number === 9200 && p.state === 'open'));
-  if (esHosts.length > 0) {
-    recs.push({
-      priority: 'HIGH',
-      category: `Elasticsearch (${esHosts.length} hosts)`,
-      targets: esHosts.map((h) => h.ip),
-      icon: '🟠',
-      checks: [
-        `curl http://{ip}:9200/_cat/indices`,
-        `curl http://{ip}:9200/_cluster/settings`,
-        `curl http://{ip}:9200/_nodes`,
-        `Check for unauthenticated access and data exposure`,
-      ],
-    });
-  }
-
-  // Web
-  const webHosts = upHosts.filter((h) =>
-    h.ports.some((p) => [80, 443, 8080, 8443, 8000].includes(p.number) && p.state === 'open')
-  );
-  if (webHosts.length > 0) {
-    recs.push({
-      priority: 'MEDIUM',
-      category: `Web Servers (${webHosts.length} hosts)`,
-      targets: webHosts.map((h) => h.ip),
-      icon: '🟡',
-      checks: [
-        `whatweb {url}`,
-        `nikto -h {url}`,
-        `gobuster dir -u {url} -w /usr/share/wordlists/dirb/common.txt`,
-        `nuclei -u {url}`,
-        `Check for default credentials`,
-        `Check for known CVEs based on detected technology`,
-      ],
-    });
-  }
-
-  // RDP
-  const rdpHosts = upHosts.filter((h) => h.ports.some((p) => p.number === 3389 && p.state === 'open'));
-  if (rdpHosts.length > 0) {
-    recs.push({
-      priority: 'MEDIUM',
-      category: `RDP (${rdpHosts.length} hosts)`,
-      targets: rdpHosts.map((h) => h.ip),
-      icon: '🟡',
-      checks: [
-        `nmap --script rdp-enum-encryption -p 3389 {ip}`,
-        `nmap --script rdp-vuln-ms12-020 -p 3389 {ip}`,
-        `hydra -L users.txt -P pass.txt rdp://{ip}`,
-        `Check NLA (Network Level Authentication)`,
-        `Check BlueKeep CVE-2019-0708`,
-      ],
-    });
-  }
-
-  return recs;
+  // Sort by priority
+  const priorityOrder: Record<string, number> = { 'CRITICAL': 0, 'HIGH': 1, 'MEDIUM': 2, 'LOW': 3 };
+  return recs.sort((a, b) => {
+    const prioDiff = (priorityOrder[a.priority] ?? 4) - (priorityOrder[b.priority] ?? 4);
+    if (prioDiff !== 0) return prioDiff;
+    return b.targets.length - a.targets.length;
+  });
 }
 
+/**
+ * Get icon for priority level
+ */
+function getPriorityIcon(priority: string): string {
+  const icons: Record<string, string> = {
+    'CRITICAL': '🔴',
+    'HIGH': '🟠',
+    'MEDIUM': '🟡',
+    'LOW': '🔵',
+  };
+  return icons[priority] || '📌';
+}
+
+// ============================================================================
+// Export Functions
+// ============================================================================
+
+/**
+ * Export targets in various formats
+ */
 export function exportTargets(
   hosts: Host[],
   category: string,
@@ -360,21 +489,39 @@ export function exportTargets(
   const upHosts = hosts.filter((h) => h.state === 'up');
   let targets: { ip: string; port?: number; service?: string; hostname?: string }[] = [];
 
-  const cat = SERVICE_CATEGORIES[category];
   if (category === 'dc') {
-    targets = upHosts
-      .filter((h) => h.isDC && (h.dcConfidence || 0) >= 0.8)
-      .map((h) => ({ ip: h.ip, hostname: h.hostname }));
-  } else if (category === 'all' || !cat) {
+    // Domain controllers
+    const adResult = detectADInfrastructure(hosts);
+    if (adResult) {
+      targets = adResult.domainControllers
+        .filter(dc => dc.host.state === 'up')
+        .map(dc => ({ 
+          ip: dc.host.ip, 
+          hostname: dc.host.hostname 
+        }));
+    }
+  } else if (category === 'unknown') {
+    // Unknown services
+    const unknownServices = otherHandler.getUnknownServices();
+    targets = unknownServices.map(s => ({
+      ip: s.hostIp,
+      port: s.port,
+      service: s.serviceName,
+    }));
+  } else if (category === 'all') {
     targets = upHosts.map((h) => ({ ip: h.ip, hostname: h.hostname }));
   } else {
-    upHosts.forEach((host) => {
-      const openPorts = host.ports.filter((p) => p.state === 'open');
-      const matched = openPorts.filter(
-        (p) => cat.ports.includes(p.number) || cat.services.some((s) => p.service.toLowerCase().includes(s))
-      );
-      matched.forEach((p) => targets.push({ ip: host.ip, port: p.number, service: p.service, hostname: host.hostname }));
-    });
+    // Specific category
+    const cat = SERVICE_CATEGORIES[category];
+    if (cat) {
+      upHosts.forEach((host) => {
+        const openPorts = host.ports.filter((p) => p.state === 'open');
+        const matched = openPorts.filter(
+          (p) => cat.ports.includes(p.number) || cat.services.some((s) => p.service.toLowerCase().includes(s.toLowerCase()))
+        );
+        matched.forEach((p) => targets.push({ ip: host.ip, port: p.number, service: p.service, hostname: host.hostname }));
+      });
+    }
   }
 
   if (format === 'json') return JSON.stringify(targets, null, 2);
@@ -398,6 +545,9 @@ export function exportTargets(
     .join('\n');
 }
 
+/**
+ * Get top services by frequency
+ */
 export function getTopServices(hosts: Host[]): { service: string; count: number; port?: number }[] {
   const counts = new Map<string, { count: number; port?: number }>();
 
@@ -416,3 +566,14 @@ export function getTopServices(hosts: Host[]): { service: string; count: number;
     .sort((a, b) => b.count - a.count)
     .slice(0, 10);
 }
+
+/**
+ * Get the OtherHandler instance for UI access
+ */
+export function getOtherHandler() {
+  return otherHandler;
+}
+
+// Re-export types and matcher for external use
+export { ServiceMatcher, otherHandler };
+export type { MatchResult, UnknownService, ServiceConfig };
