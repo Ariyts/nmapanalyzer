@@ -2,7 +2,7 @@
 node_modules/
 
 # Build output
-dist/
+# dist/  # Uncommented for GitHub Pages deployment
 
 # IDE
 .idea/
